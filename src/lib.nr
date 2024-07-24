@@ -10,17 +10,18 @@ use crate::curve_jac::AffineTranscript;
 use crate::curve_jac::AffineLinearExpressionTranscript;
 use crate::curve_jac::CurveJ;
 use dep::bignum::BigNumTrait;
+use dep::bignum::BigNumInstanceTrait;
 
 /**
  * @brief Implements an elliptic curve instantiated over a prime field that is NOT the circuit's native field
  **/
-struct BigCurve<BigNum, CurveParams> {
+struct BigCurve<BigNumInstance, BigNum, CurveParams> {
     x: BigNum,
     y: BigNum,
     is_infinity: bool,
 }
 
-trait CurveParamsTrait<BigNum> where BigNum: BigNumTrait {
+trait CurveParamsTrait<BigNumInstance, BigNum> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     fn offset_generator() -> [BigNum; 2];
     fn offset_generator_final() -> [BigNum; 2];
     fn one() -> [BigNum; 2];
@@ -38,12 +39,12 @@ trait CurveParamsTrait<BigNum> where BigNum: BigNumTrait {
  * For each iteration `i` we double the accumulator 4 times and then add `T[slice[i]]` into the accumulator.
  * For small multiscalar multiplications (i.e. <512 points) this produces the minimal number of addition operations.
  **/
-struct PointTable<BigNum> {
+struct PointTable<BigNumInstance, BigNum> {
     x: [BigNum; 16],
     y: [BigNum; 16],
 }
 
-impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
+impl<BigNumInstance, BigNum> PointTable<BigNumInstance, BigNum> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     fn empty() -> Self {
         PointTable { x: [BigNum::new(); 16], y: [BigNum::new(); 16] }
     }
@@ -53,25 +54,26 @@ impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
      * (see `CurveJ::mul` for an example of how AffineTranscript objects are generated/used)
      **/
     fn new_with_hint<CurveParams>(
-        P: BigCurve<BigNum, CurveParams>,
-        transcript: [AffineTranscript<BigNum>; 8]
-    ) -> Self where CurveParams: CurveParamsTrait<BigNum> {
+        P: BigCurve<BigNumInstance, BigNum, CurveParams>,
+        transcript: [AffineTranscript<BigNumInstance, BigNum>; 8],
+        bn: BigNumInstance
+    ) -> Self where CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
         let mut result = PointTable { x: [BigNum::new(); 16], y: [BigNum::new(); 16] };
 
-        let D2 = P.double_with_hint(transcript[0]);
+        let D2 = P.double_with_hint(transcript[0], bn);
 
         result.x[8] = P.x;
         result.y[8] = P.y;
         result.x[7] = P.x;
-        result.y[7] = (P.y.neg());
+        result.y[7] = (bn.neg(P.y));
 
         let mut A = P;
         for i in 1..8 {
-            A = D2.incomplete_add_with_hint(A, transcript[i]);
+            A = D2.incomplete_add_with_hint(A, transcript[i], bn);
             result.x[8 + i] = A.x;
             result.y[8 + i] = A.y;
             result.x[7 - i] = A.x;
-            result.y[7 - i] = (A.y.neg());
+            result.y[7 - i] = (bn.neg(A.y));
         }
         result
     }
@@ -81,17 +83,17 @@ impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
      * @description if the backend has an efficient implementation of memory lookups,
      * this will be very efficient (~12 constraints for 256-bit curves using the barretenberg backend)
      **/
-    fn get<CurveParams>(self, idx: u8) -> BigCurve<BigNum, CurveParams> {
+    fn get<CurveParams>(self, idx: u8) -> BigCurve<BigNumInstance, BigNum, CurveParams> {
         BigCurve { x: self.x[idx], y: self.y[idx], is_infinity: false }
     }
 }
 
-impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNum>, BigNum: BigNumTrait {
+impl<BigNumInstance, BigNum, CurveParams> BigCurve<BigNumInstance, BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNumInstance, BigNum>, BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     /**
     * @brief negate a point
     **/
-    fn neg(self) -> Self {
-        BigCurve { x: self.x, y: self.y.neg(), is_infinity: self.is_infinity }
+    fn neg(self, bn: BigNumInstance) -> Self {
+        BigCurve { x: self.x, y: bn.neg(self.y), is_infinity: self.is_infinity }
     }
 
     fn point_at_infinity() -> Self {
@@ -121,17 +123,17 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         BigCurve { x, y, is_infinity }
     }
 
-    fn validate_on_curve(self) {
+    fn validate_on_curve(self, bn: BigNumInstance) {
         // if is point at infinity, we're on the curve.
         // In this case just sub in a valid point for the x/y coordinates we are about to test
         let one: Self = BigCurve::one();
         let x: BigNum = BigNum::conditional_select(one.x, self.x, self.is_infinity);
         let y: BigNum = BigNum::conditional_select(one.y, self.y, self.is_infinity);
-        let xx = x.mul(x); // hmm?
+        let xx = bn.mul(x, x); // hmm?
         //  xxx - yy + ax + b = 0
         // (xx + a) * x - y*y + b = 0
         // validate the provided value of `y3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[xx, CurveParams::a()], [y, BigNum::new()]],
             [[false, false], [false, false]],
             [[x], [y]],
@@ -152,7 +154,12 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
      * The expensive operation in BigNum is the modular reduction.
      * e.g. (a * b + c * d = e mod p) is not much more expensive than (a * b = c mod p)
      **/
-    fn incomplete_add_with_hint(self, other: Self, transcript: AffineTranscript<BigNum>) -> Self {
+    fn incomplete_add_with_hint(
+        self,
+        other: Self,
+        transcript: AffineTranscript<BigNumInstance, BigNum>,
+        bn: BigNumInstance
+    ) -> Self {
         let x1: BigNum = self.x;
         let y1: BigNum = self.y;
         let x2: BigNum = other.x;
@@ -167,10 +174,10 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         lambda.validate_in_range();
 
         // no incomplete Weierstrass shenanigans here
-        x1.assert_is_not_equal(x2);
+        bn.assert_is_not_equal(x1, x2);
 
         // validate the provided value of `lambda` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x2, x1]],
@@ -180,7 +187,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `x3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[lambda]],
@@ -190,7 +197,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `y3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x3, x1]],
@@ -202,7 +209,12 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         BigCurve { x: x3, y: y3, is_infinity: false }
     }
 
-    fn add_with_hint(self, other: Self, transcript: AffineTranscript<BigNum>) -> Self {
+    fn add_with_hint(
+        self,
+        other: Self,
+        transcript: AffineTranscript<BigNumInstance, BigNum>,
+        bn: BigNumInstance
+    ) -> Self {
         let mut x1: BigNum = self.x;
         let mut y1: BigNum = self.y;
         let mut x2: BigNum = other.x;
@@ -217,8 +229,8 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         lambda.validate_in_range();
 
         // TODO: we can probably optimize this boolean flag jenga mess
-        let x_equal_predicate = x2.eq(x1);
-        let y_equal_predicate = y2.eq(y1);
+        let x_equal_predicate = bn.eq(x2, x1);
+        let y_equal_predicate = bn.eq(y2, y1);
         let double_predicate = x_equal_predicate | (self.is_infinity | other.is_infinity); // if x1 == x2, evaluate double operation. If y1 = -y2 then we set all input/output parameters to be 0
         let infinity_predicate = (x_equal_predicate & !y_equal_predicate) | (self.is_infinity & other.is_infinity);
         let evaluate_group_operation_predicate: bool = !infinity_predicate & !self.is_infinity & !other.is_infinity;
@@ -234,10 +246,10 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         // or
         // lambda * (x2 - x1) - (y2 - y1) = 0
         let product_1_rhs_t0 = BigNum::conditional_select(y1, x2, double_predicate);
-        let product_1_rhs_t1 = BigNum::conditional_select(y1, x1.neg(), double_predicate);
+        let product_1_rhs_t1 = BigNum::conditional_select(y1, bn.neg(x1), double_predicate);
         let product_2_lhs_t0 = BigNum::conditional_select(x1, BigNum::one(), double_predicate);
         let product_2_rhs_t0 = BigNum::conditional_select(x1, y2, double_predicate);
-        let product_2_rhs_t1 = BigNum::conditional_select(x1, y1.neg(), double_predicate);
+        let product_2_rhs_t1 = BigNum::conditional_select(x1, bn.neg(y1), double_predicate);
         let product_2_rhs_t2 = BigNum::conditional_select(x1, BigNum::new(), double_predicate);
 
         // validate the provided value of `lambda` is correct
@@ -249,7 +261,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
             x_equal_predicate & !y_equal_predicate & !self.is_infinity & !other.is_infinity
         );
 
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda], [product_2_lhs_t0]],
             [[false], [false]],
             [
@@ -262,7 +274,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
 
         // x3 = lambda * lambda - x2 - x1
         // if double, then x2 = x1 so we good
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[lambda]],
@@ -272,7 +284,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // y3 = lambda * (x1 - x3) - y1
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x3, x1]],
@@ -299,15 +311,16 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         infinity_out = conditional_select(self.is_infinity, infinity_out, output_is_lhs);
         infinity_out = conditional_select(other.is_infinity, infinity_out, output_is_rhs);
 
-        println(f"output is lhs = {output_is_lhs}, output is rhs = {output_is_rhs}");
-        println(f"rhs x vs out x = {x_out}, output is rhs = {x2}");
-        println(f"infinity out = {infinity_out}");
-
         let result: Self = BigCurve { x: x_out, y: y_out, is_infinity: infinity_out };
         result
     }
 
-    fn sub_with_hint(self, other: Self, transcript: AffineTranscript<BigNum>) -> Self {
+    fn sub_with_hint(
+        self,
+        other: Self,
+        transcript: AffineTranscript<BigNumInstance, BigNum>,
+        bn: BigNumInstance
+    ) -> Self {
         let mut x1: BigNum = self.x;
         let mut y1: BigNum = self.y;
         let mut x2: BigNum = other.x;
@@ -321,8 +334,8 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         y3.validate_in_range();
         lambda.validate_in_range();
 
-        let x_equal_predicate = x2.eq(x1);
-        let y_equal_predicate = y2.eq(y1) == false;
+        let x_equal_predicate = bn.eq(x2, x1);
+        let y_equal_predicate = bn.eq(y2, y1) == false;
         let double_predicate = x_equal_predicate | (self.is_infinity | other.is_infinity); // if x1 == x2, evaluate double operation. If y1 = -y2 then we set all input/output parameters to be 0
         let infinity_predicate = (x_equal_predicate & !y_equal_predicate) | (self.is_infinity & other.is_infinity);
         let evaluate_group_operation_predicate: bool = !infinity_predicate & !self.is_infinity & !other.is_infinity;
@@ -340,7 +353,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         // y1 - (y2.neg()) - lambda * (x1 - x2) = 0
         // y1 + y2 - lambda * (x1 - x2) = 0
         // 3 * x * x - lambda * 2 * y 
-        let product_1_rhs_t0 = BigNum::conditional_select(y1, x2.neg(), double_predicate);
+        let product_1_rhs_t0 = BigNum::conditional_select(y1, bn.neg(x2), double_predicate);
         let product_1_rhs_t1 = BigNum::conditional_select(y1, x1, double_predicate);
         let product_2_lhs_t0 = BigNum::conditional_select(x1, BigNum::one(), double_predicate);
         let product_2_rhs_t0 = BigNum::conditional_select(x1, y2, double_predicate);
@@ -355,7 +368,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
             BigNum::new(),
             x_equal_predicate & !y_equal_predicate & !self.is_infinity & !other.is_infinity
         );
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda], [product_2_lhs_t0]],
             [[true], [false]],
             [
@@ -368,7 +381,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
 
         // x3 = lambda * lambda - x2 - x1
         // if double, then x2 = x1 so we good
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[lambda]],
@@ -378,7 +391,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // y3 = lambda * (x1 - x3) - y1
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x3, x1]],
@@ -395,7 +408,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         x_out = BigNum::conditional_select(BigNum::new(), x_out, infinity_predicate);
         let mut y_out = BigNum::conditional_select(y3, y1, evaluate_group_operation_predicate);
         y_out = BigNum::conditional_select(self.y, y_out, output_is_lhs);
-        y_out = BigNum::conditional_select(other.y.neg(), y_out, output_is_rhs);
+        y_out = BigNum::conditional_select(bn.neg(other.y), y_out, output_is_rhs);
         y_out = BigNum::conditional_select(BigNum::new(), y_out, infinity_predicate);
 
         let conditional_select = |a: bool, b: bool, predicate: bool| ((a as Field - b as Field) * predicate as Field + b as Field) as bool;
@@ -404,17 +417,17 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         infinity_out = conditional_select(true, infinity_out, infinity_predicate);
         infinity_out = conditional_select(self.is_infinity, infinity_out, output_is_lhs);
         infinity_out = conditional_select(other.is_infinity, infinity_out, output_is_rhs);
-        println(f"INFINITY PREDICATE = {infinity_predicate}");
-        println(f"output_is_lhs = {output_is_lhs}");
-        println(f"output_is_rhs = {output_is_rhs}");
-
-        println(f"INFINITY OUT = {infinity_out}");
 
         let result: Self = BigCurve { x: x_out, y: y_out, is_infinity: infinity_out };
         result
     }
 
-    fn incomplete_subtract_with_hint(self, other: Self, transcript: AffineTranscript<BigNum>) -> Self {
+    fn incomplete_subtract_with_hint(
+        self,
+        other: Self,
+        transcript: AffineTranscript<BigNumInstance, BigNum>,
+        bn: BigNumInstance
+    ) -> Self {
         let x1: BigNum = self.x;
         let y1: BigNum = self.y;
         let x2: BigNum = other.x;
@@ -429,10 +442,10 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         lambda.validate_in_range();
 
         // no incomplete Weierstrass shenanigans here
-        x1.assert_is_not_equal(x2);
+        bn.assert_is_not_equal(x1, x2);
 
         // validate the provided value of `lambda` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x2, x1]],
@@ -442,7 +455,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `x3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[lambda]],
@@ -452,7 +465,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `y3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x3, x1]],
@@ -465,11 +478,11 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
     }
 
     /**
-     * @brief Double a point, using an AffineTranscript that contains inverses and output witnesses
-     * @note This method minimizes the number of calls to `evalute_quadratic_expression`,
-     * which is NOT the same as minimizing the number of multiplications.
-     **/
-    fn double_with_hint(self, transcript: AffineTranscript<BigNum>) -> Self where {
+ * @brief Double a point, using an AffineTranscript that contains inverses and output witnesses
+ * @note This method minimizes the number of calls to `evalute_quadratic_expression`,
+ * which is NOT the same as minimizing the number of multiplications.
+ **/
+    fn double_with_hint(self, transcript: AffineTranscript<BigNumInstance, BigNum>, bn: BigNumInstance) -> Self {
         let x1: BigNum = self.x;
         let y1: BigNum = self.y;
         let lambda: BigNum = transcript.lambda;
@@ -485,7 +498,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         // -lambda * 2y + 3*x*x + a = 0
         // validate the provided value of `lambda` is correct
         // n.b. if CurveParams::a() == 0, its inclusion shouldn't cost extra constraints...I thnk
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[x1, x1, x1], [y1, y1, BigNum::new()]],
             [[false, false, false], [false, false, false]],
             [[x1], [lambda]],
@@ -495,7 +508,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `x3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[lambda]],
@@ -505,7 +518,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         );
 
         // validate the provided value of `y3` is correct
-        BigNum::evaluate_quadratic_expression(
+        bn.evaluate_quadratic_expression(
             [[lambda]],
             [[false]],
             [[x3, x1]],
@@ -518,44 +531,46 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
     }
 
     /**
-     * @brief Perform an ecc scalar multiplication, given an [AffineTranscript] generated via unconstrained functions
-     **/
+ * @brief Perform an ecc scalar multiplication, given an [AffineTranscript] generated via unconstrained functions
+ **/
     fn mul_with_hint<let NScalarSlices: u32, let NTranscriptSlices: u32>(
         self,
         scalar: ScalarField<NScalarSlices>,
-        transcript: [AffineTranscript<BigNum>; NTranscriptSlices]
+        transcript: [AffineTranscript<BigNumInstance, BigNum>; NTranscriptSlices],
+        bn: BigNumInstance
     ) -> Self {
         // Compute a 4-bit lookup table of multiples of P
         let input: Self = BigCurve::conditional_select(BigCurve::one(), self, self.is_infinity);
         let scalar: ScalarField<NScalarSlices> = ScalarField::conditional_select(ScalarField::zero(), scalar, self.is_infinity);
 
-        let T: PointTable<BigNum> = PointTable::new_with_hint(
+        let T: PointTable<BigNumInstance, BigNum> = PointTable::new_with_hint(
             input,
             [
             transcript[0], transcript[1], transcript[2], transcript[3], transcript[4], transcript[5], transcript[6], transcript[7]
-        ]
+        ],
+            bn
         );
 
         // Init the accumulator from the most significant scalar slice
         let mut accumulator: Self = BigCurve::offset_generator();
-        let mut accumulator = accumulator.incomplete_add_with_hint(T.get(scalar.base4_slices[0]), transcript[3 + 5]);
+        let mut accumulator = accumulator.incomplete_add_with_hint(T.get(scalar.base4_slices[0]), transcript[3 + 5], bn);
 
         // Perform the "double and add" algorithm but in steps of 4 bits, using the lookup table T to extract 4-bit multiples of P
         for i in 1..NScalarSlices {
-            accumulator = accumulator.double_with_hint(transcript[4 + 5 * i]);
-            accumulator = accumulator.double_with_hint(transcript[5 + 5 * i]);
-            accumulator = accumulator.double_with_hint(transcript[6 + 5 * i]);
-            accumulator = accumulator.double_with_hint(transcript[7 + 5 * i]);
-            accumulator = accumulator.incomplete_add_with_hint(T.get(scalar.base4_slices[i]), transcript[8 + 5 * i]);
+            accumulator = accumulator.double_with_hint(transcript[4 + 5 * i], bn);
+            accumulator = accumulator.double_with_hint(transcript[5 + 5 * i], bn);
+            accumulator = accumulator.double_with_hint(transcript[6 + 5 * i], bn);
+            accumulator = accumulator.double_with_hint(transcript[7 + 5 * i], bn);
+            accumulator = accumulator.incomplete_add_with_hint(T.get(scalar.base4_slices[i]), transcript[8 + 5 * i], bn);
         }
 
         // windowed non-adjacent form can only represent odd scalar values.
         // if value is even, the result will be off by one and we need to subtract the input point
         if (scalar.skew) {
-            accumulator = accumulator.incomplete_subtract_with_hint(input, transcript[4 + 5 * NScalarSlices]);
+            accumulator = accumulator.incomplete_subtract_with_hint(input, transcript[4 + 5 * NScalarSlices], bn);
         }
 
-        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), transcript[5 + 5 * NScalarSlices]);
+        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), transcript[5 + 5 * NScalarSlices], bn);
         accumulator
     }
 
@@ -563,12 +578,13 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
     //       conditional subtract, conditional add
     //      
     /**
-     * @brief Perform an ecc scalar multiplication, given an [AffineTranscript] generated via unconstrained functions
-     **/
+ * @brief Perform an ecc scalar multiplication, given an [AffineTranscript] generated via unconstrained functions
+ **/
     fn msm_with_hint_internal<let Size: u32, let NScalarSlices: u32, let NTranscriptSlices: u32>(
         mut points: [Self; Size],
         mut scalars: [ScalarField<NScalarSlices>; Size],
-        transcript: [AffineTranscript<BigNum>; NTranscriptSlices]
+        transcript: [AffineTranscript<BigNumInstance, BigNum>; NTranscriptSlices],
+        bn: BigNumInstance
     ) -> Self {
         // Compute a 4-bit lookup table of multiples of P
 
@@ -581,38 +597,40 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         points = _inputs;
         scalars = _scalars;
 
-        let mut tables: [PointTable<BigNum>; Size] = [PointTable::empty(); Size];
+        let mut tables: [PointTable<BigNumInstance, BigNum>; Size] = [PointTable::empty(); Size];
         for i in 0..Size {
-            let mut table_transcript: [AffineTranscript<BigNum>; 8] = [AffineTranscript::new(); 8];
+            let mut table_transcript: [AffineTranscript<BigNumInstance, BigNum>; 8] = [AffineTranscript::new(); 8];
             for j in 0..8 {
                 table_transcript[j] = transcript[i * 8 + j];
             }
-            tables[i] = PointTable::new_with_hint(points[i], table_transcript);
+            tables[i] = PointTable::new_with_hint(points[i], table_transcript, bn);
         }
 
         // Init the accumulator from the most significant scalar slice
         let mut accumulator: Self = BigCurve::offset_generator();
         let mut accumulator = accumulator.incomplete_add_with_hint(
             tables[0].get(scalars[0].base4_slices[0]),
-            transcript[8 * Size]
+            transcript[8 * Size],
+            bn
         );
 
         for i in 1..Size {
             accumulator = accumulator.incomplete_add_with_hint(
-                tables[i].get(scalars[i].base4_slices[0]),
-                transcript[8 * Size + i]
-            );
+            tables[i].get(scalars[i].base4_slices[0]),
+            transcript[8 * Size + i],
+            bn
+        );
         }
 
         // Perform the "double and add" algorithm but in steps of 4 bits, using the lookup table T to extract 4-bit multiples of P
         for i in 1..NScalarSlices {
-            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1)]);
-            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 1]);
-            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 2]);
-            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 3]);
+            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1)], bn);
+            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 1], bn);
+            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 2], bn);
+            accumulator = accumulator.double_with_hint(transcript[9 * Size + (4 + Size) * (i - 1) + 3], bn);
 
             for j in 0..Size {
-                accumulator = accumulator.incomplete_add_with_hint(tables[j].get(scalars[j].base4_slices[i]), transcript[9 * Size + (4 + Size) * (i - 1) + 4 + j]);
+                accumulator = accumulator.incomplete_add_with_hint(tables[j].get(scalars[j].base4_slices[i]), transcript[9 * Size + (4 + Size) * (i - 1) + 4 + j], bn);
             }
         }
 
@@ -622,7 +640,7 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         // if value is even, the result will be off by one and we need to subtract the input point
         for i in 0..Size {
             if (scalars[i].skew) {
-                accumulator = accumulator.incomplete_subtract_with_hint(points[i], transcript[9 * Size + (4 + Size) * (NScalarSlices - 1) + i]);
+                accumulator = accumulator.incomplete_subtract_with_hint(points[i], transcript[9 * Size + (4 + Size) * (NScalarSlices - 1) + i], bn);
             }
         }
 
@@ -632,33 +650,36 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
     fn msm_with_hint<let Size: u32, let NScalarSlices: u32, let NTranscriptSlices: u32>(
         mut points: [Self; Size],
         mut scalars: [ScalarField<NScalarSlices>; Size],
-        transcript: [AffineTranscript<BigNum>; NTranscriptSlices]
+        transcript: [AffineTranscript<BigNumInstance, BigNum>; NTranscriptSlices],
+        bn: BigNumInstance
     ) -> Self {
-        let mut accumulator = BigCurve::msm_with_hint_internal(points, scalars, transcript);
-        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), transcript[10 * Size + (4 + Size) * (NScalarSlices - 1)]);
+        let mut accumulator = BigCurve::msm_with_hint_internal(points, scalars, transcript, bn);
+        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), transcript[10 * Size + (4 + Size) * (NScalarSlices - 1)], bn);
         accumulator
     }
 
     unconstrained fn get_mul_transcript<let NScalarSlices: u64>(
         P: Self,
-        scalar: ScalarField<NScalarSlices>
-    ) -> [AffineTranscript<BigNum, CurveParams>; 326] {
-        CurveJ::from(P).mul(scalar).1.as_array()
+        scalar: ScalarField<NScalarSlices>,
+        bn: BigNumInstance
+    ) -> [AffineTranscript<BigNumInstance, BigNum, CurveParams>; 326] {
+        CurveJ::from(P).mul(scalar, bn).1.as_array()
     }
 
     // Expensive witness generation! Avoid if possible 
-    fn mul<let NScalarSlices: u64>(self, scalar: ScalarField<NScalarSlices>) -> Self {
-        let transcript: [AffineTranscript<BigNum, CurveParams>; 326] = BigCurve::get_mul_transcript(self, scalar);
+    fn mul<let NScalarSlices: u64>(self, scalar: ScalarField<NScalarSlices>, bn: BigNumInstance) -> Self {
+        let transcript: [AffineTranscript<BigNumInstance, BigNum, CurveParams>; 326] = BigCurve::get_mul_transcript(self, scalar, bn);
 
-        self.mul_with_hint(scalar, transcript)
+        self.mul_with_hint(scalar, transcript, bn)
     }
 
     fn evaluate_linear_expression<let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>(
         mut mul_points: [Self; NMuls],
         mut mul_scalars: [ScalarField<NScalarSlices>; NMuls],
-        add_points: [Self; NAdds]
+        add_points: [Self; NAdds],
+        bn: BigNumInstance
     ) -> Self {
-        let affine_transcript: AffineLinearExpressionTranscript<BigNum, CurveParams, NScalarSlices, NMuls, NAdds> = CurveJ::compute_linear_expression_transcript(mul_points, mul_scalars, add_points);
+        let affine_transcript: AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, NScalarSlices, NMuls, NAdds> = CurveJ::compute_linear_expression_transcript(mul_points, mul_scalars, add_points, bn);
 
         let mut _inputs: [Self; NMuls] = [BigCurve::one(); NMuls];
         let mut  _scalars: [ScalarField<NScalarSlices>; NMuls] = [ScalarField::new(); NMuls];
@@ -669,34 +690,36 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         let msm_points = _inputs;
         let scalars = _scalars;
 
-        let mut tables: [PointTable<BigNum>; NMuls] = [PointTable::empty(); NMuls];
+        let mut tables: [PointTable<BigNumInstance, BigNum>; NMuls] = [PointTable::empty(); NMuls];
         for i in 0..NMuls {
-            tables[i] = PointTable::new_with_hint(msm_points[i], affine_transcript.table_transcript[i]);
+            tables[i] = PointTable::new_with_hint(msm_points[i], affine_transcript.table_transcript[i], bn);
         }
 
         // Init the accumulator from the most significant scalar slice
         let mut accumulator: Self = BigCurve::offset_generator();
         let mut accumulator = accumulator.incomplete_add_with_hint(
             tables[0].get(scalars[0].base4_slices[0]),
-            affine_transcript.msm_add_transcript[0][0]
+            affine_transcript.msm_add_transcript[0][0],
+            bn
         );
 
         for i in 1..NMuls {
             accumulator = accumulator.incomplete_add_with_hint(
-                tables[i].get(scalars[i].base4_slices[0]),
-                affine_transcript.msm_add_transcript[0][i]
-            );
+            tables[i].get(scalars[i].base4_slices[0]),
+            affine_transcript.msm_add_transcript[0][i],
+            bn
+        );
         }
 
         // Perform the "double and add" algorithm but in steps of 4 bits, using the lookup table T to extract 4-bit multiples of P
         for i in 1..NScalarSlices {
-            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][0]);
-            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][1]);
-            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][2]);
-            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][3]);
+            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][0], bn);
+            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][1], bn);
+            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][2], bn);
+            accumulator = accumulator.double_with_hint(affine_transcript.msm_double_transcript[i][3], bn);
 
             for j in 0..NMuls {
-                accumulator = accumulator.incomplete_add_with_hint(tables[j].get(scalars[j].base4_slices[i]), affine_transcript.msm_add_transcript[i][j]);
+                accumulator = accumulator.incomplete_add_with_hint(tables[j].get(scalars[j].base4_slices[i]), affine_transcript.msm_add_transcript[i][j], bn);
             }
         }
 
@@ -706,51 +729,41 @@ impl<BigNum, CurveParams> BigCurve<BigNum, CurveParams> where CurveParams: Curve
         // if value is even, the result will be off by one and we need to subtract the input point
         for i in 0..NMuls {
             if (scalars[i].skew) {
-                accumulator = accumulator.incomplete_subtract_with_hint(msm_points[i], affine_transcript.skew_transcript[i]);
+                accumulator = accumulator.incomplete_subtract_with_hint(msm_points[i], affine_transcript.skew_transcript[i], bn);
             }
         }
 
         for i in 0..NAdds {
-            let res = accumulator.incomplete_subtract_with_hint(add_points[i], affine_transcript.add_transcript[i]);
+            let res = accumulator.incomplete_subtract_with_hint(add_points[i], affine_transcript.add_transcript[i], bn);
             accumulator = BigCurve::conditional_select(accumulator, res, add_points[i].is_infinity);
         }
 
-        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), affine_transcript.offset_generator_transcript);
+        accumulator = accumulator.sub_with_hint(BigCurve::offset_generator_final(), affine_transcript.offset_generator_transcript, bn);
 
         accumulator
     }
-}
 
-impl<BigNum, CurveParams> std::ops::Add for BigCurve<BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNum>, BigNum: BigNumTrait {
     // Expensive witness generation! Avoid if possible 
-    fn add(self, other: Self) -> Self {
+    fn add(self, other: Self, bn: BigNumInstance) -> Self {
         let lhsJ = CurveJ::from(self);
         let rhsJ = CurveJ:: from(other);
 
-        let transcript = AffineTranscript::from_j(lhsJ.add(rhsJ).1);
+        let transcript = AffineTranscript::from_j(lhsJ.add(rhsJ, bn).1, bn);
 
-        self.add_with_hint(other, transcript)
+        self.add_with_hint(other, transcript, bn)
     }
-}
-
-impl<BigNum, CurveParams> std::ops::Sub for BigCurve<BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNum>, BigNum: BigNumTrait {
     // Expensive witness generation! Avoid if possible 
-    fn sub(self, other: Self) -> Self {
+    fn sub(self, other: Self, bn: BigNumInstance) -> Self {
         let lhsJ = CurveJ::from(self);
         let rhsJ = CurveJ:: from(other);
 
-        let transcript = AffineTranscript::from_j(lhsJ.sub(rhsJ).1);
+        let transcript = AffineTranscript::from_j(lhsJ.sub(rhsJ, bn).1, bn);
 
-        self.sub_with_hint(other, transcript)
+        self.sub_with_hint(other, transcript, bn)
     }
-}
 
-/**
- * @brief are two Affine points equal?
- **/
-impl<BigNum, CurveParams> std::cmp::Eq for BigCurve<BigNum, CurveParams> where BigNum: BigNumTrait {
-    fn eq(self, other: Self) -> bool {
-        let coords_equal = self.x.eq(other.x) & self.y.eq(other.y) & !self.is_infinity & !other.is_infinity;
+    fn eq(self, other: Self, bn: BigNumInstance) -> bool {
+        let coords_equal = bn.eq(self.x, other.x) & bn.eq(self.y, other.y) & !self.is_infinity & !other.is_infinity;
         let infinity = self.is_infinity & other.is_infinity;
         coords_equal | infinity
     }

@@ -1,5 +1,6 @@
 use dep::bignum::BigNum;
 use dep::bignum::BigNumTrait;
+use dep::bignum::BigNumInstanceTrait;
 use crate::scalar_field::ScalarField;
 use crate::CurveParamsTrait;
 use crate::BigCurve;
@@ -22,7 +23,7 @@ use crate::BigCurve;
  *              i.e. we compute 1 modular inverse instead of ~256 or 320 depending on the elliptic curve.
  *              Yes, this is an extremely complex solution to a simple problem. Such is life. Inverses are expensive to generate witnesses for.
  **/
-struct CurveJ<BigNum, CurveParams> {
+struct CurveJ<BigNumInstance, BigNum, CurveParams> {
     x: BigNum,
     y: BigNum,
     z: BigNum,
@@ -34,14 +35,14 @@ struct CurveJ<BigNum, CurveParams> {
  * x3, y3, z3 = the output of the group operation
  * lambda_numerator = numerator of the `lambda` term (the denominator is assumed to be z3)
  **/
-struct JTranscript<BigNum> {
+struct JTranscript<BigNumInstance, BigNum> {
     lambda_numerator: BigNum,
     x3: BigNum,
     y3: BigNum,
     z3: BigNum
 }
 
-impl<BigNum> JTranscript<BigNum> where BigNum: BigNumTrait {
+impl<BigNumInstance, BigNum> JTranscript<BigNumInstance, BigNum> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     unconstrained fn new() -> Self {
         JTranscript { lambda_numerator: BigNum::new(), x3: BigNum::new(), y3: BigNum::new(), z3: BigNum::new() }
     }
@@ -55,7 +56,7 @@ impl<BigNum> JTranscript<BigNum> where BigNum: BigNumTrait {
  * For doubling, lambda = (3 * x1 * x1) / (2 * y1)
  * If we have an array of JTranscript objects, we can turn them into AffineTranscript objects with only 1 modular inverse
  **/
-struct AffineTranscript<BigNum> {
+struct AffineTranscript<BigNumInstance, BigNum> {
     lambda: BigNum,
     x3: BigNum,
     y3: BigNum
@@ -64,27 +65,34 @@ struct AffineTranscript<BigNum> {
 /**
  * @brief construct a sequence of AffineTranscript objects from a sequence of Jacobian transcript objects
  **/
-impl<BigNum> AffineTranscript<BigNum> where BigNum: BigNumTrait {
+impl<BigNumInstance, BigNum> AffineTranscript<BigNumInstance, BigNum> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     fn new() -> Self {
         AffineTranscript { lambda: BigNum::new(), x3: BigNum::new(), y3: BigNum::new() }
     }
 
-    unconstrained fn from_j(j_tx: JTranscript<BigNum>) -> Self {
-        AffineTranscript::from_jacobian_transcript([j_tx].as_slice())[0]
+    unconstrained fn from_j(j_tx: JTranscript<BigNumInstance, BigNum>, bn: BigNumInstance) -> Self {
+        AffineTranscript::from_jacobian_transcript([j_tx].as_slice(), bn)[0]
     }
 
-    unconstrained pub fn from_j_with_hint(j_tx: JTranscript<BigNum, CurveParams>, inverse: BigNum) -> AffineTranscript<BigNum> {
+    unconstrained pub fn from_j_with_hint(
+        j_tx: JTranscript<BigNumInstance, BigNum, CurveParams>,
+        inverse: BigNum,
+        bn: BigNumInstance
+    ) -> AffineTranscript<BigNumInstance, BigNum> {
         let z_inv = inverse;
-        let zz = z_inv.__mulmod(z_inv);
-        let zzz = zz.__mulmod(z_inv);
-        let lambda = j_tx.lambda_numerator.__mulmod(z_inv);
-        let x3 = j_tx.x3.__mulmod(zz);
-        let y3 = j_tx.y3.__mulmod(zzz);
+        let zz = bn.__mulmod(z_inv, z_inv);
+        let zzz = bn.__mulmod(zz, z_inv);
+        let lambda = bn.__mulmod(j_tx.lambda_numerator, z_inv);
+        let x3 = bn.__mulmod(j_tx.x3, zz);
+        let y3 = bn.__mulmod(j_tx.y3, zzz);
         AffineTranscript { x3, y3, lambda }
     }
 
-    unconstrained fn from_jacobian_transcript(j_tx: [JTranscript<BigNum>]) -> [AffineTranscript<BigNum>] {
-        let mut result: [AffineTranscript<BigNum>] = &[];
+    unconstrained fn from_jacobian_transcript(
+        j_tx: [JTranscript<BigNumInstance, BigNum>],
+        bn: BigNumInstance
+    ) -> [AffineTranscript<BigNumInstance, BigNum>] {
+        let mut result: [AffineTranscript<BigNumInstance, BigNum>] = &[];
 
         let mut inverses: [BigNum] = &[];
         for i in 0..j_tx.len() {
@@ -92,15 +100,15 @@ impl<BigNum> AffineTranscript<BigNum> where BigNum: BigNumTrait {
         }
 
         // tadaa
-        BigNum::__batch_invert(&mut inverses);
+        let inverses = bn.__batch_invert(inverses.as_array());
 
         for i in 0..j_tx.len() {
             let z_inv = inverses[i];
-            let zz = z_inv.__mulmod(z_inv);
-            let zzz = zz.__mulmod(z_inv);
-            let lambda = j_tx[i].lambda_numerator.__mulmod(z_inv);
-            let x3 = j_tx[i].x3.__mulmod(zz);
-            let y3 = j_tx[i].y3.__mulmod(zzz);
+            let zz = bn.__mulmod(z_inv, z_inv);
+            let zzz = bn.__mulmod(zz, z_inv);
+            let lambda = bn.__mulmod(j_tx[i].lambda_numerator, z_inv);
+            let x3 = bn.__mulmod(j_tx[i].x3, zz);
+            let y3 = bn.__mulmod(j_tx[i].y3, zzz);
             result = result.push_back(AffineTranscript { lambda, x3, y3 });
         }
         result
@@ -117,14 +125,14 @@ impl<BigNum> AffineTranscript<BigNum> where BigNum: BigNumTrait {
  * For each iteration `i` we double the accumulator 4 times and then add `T[slice[i]]` into the accumulator.
  * For small multiscalar multiplications (i.e. <512 points) this produces the minimal number of addition operations.
  **/
-struct PointTable<BigNum> {
+struct PointTable<BigNumInstance, BigNum> {
     x: [BigNum; 16],
     y: [BigNum; 16],
     z: [BigNum; 16],
-    transcript: [JTranscript<BigNum>; 8]
+    transcript: [JTranscript<BigNumInstance, BigNum>; 8]
 }
 
-impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
+impl<BigNumInstance, BigNum> PointTable<BigNumInstance, BigNum> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
     fn empty() -> Self {
         PointTable {
             x: [BigNum::new(); 16],
@@ -141,32 +149,35 @@ impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
      * [0, P, ..., 15P] requires 14 group operations.
      * group operations are expensive!
      **/
-    unconstrained fn new<CurveParams>(P: CurveJ<BigNum, CurveParams>) -> Self where CurveParams: CurveParamsTrait<BigNum> {
+    unconstrained fn new<CurveParams>(
+        bn: BigNumInstance,
+        P: CurveJ<BigNumInstance, BigNum, CurveParams>
+    ) -> Self where CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
         let mut result = PointTable {
             x: [BigNum::new(); 16],
             y: [BigNum::new(); 16],
             z: [BigNum::new(); 16],
             transcript: [JTranscript::new(); 8]
         };
-        let op = P.dbl();
+        let op = P.dbl(bn);
         let D2 = op.0;
         result.transcript[0] = op.1;
         result.x[7] = P.x;
-        result.y[7] = P.y.__negate();
+        result.y[7] = bn.__negate(P.y);
         result.z[7] = P.z;
         result.x[8] = P.x;
         result.y[8] = P.y;
         result.z[8] = P.z;
         let mut A = P;
         for i in 1..8 {
-            let op = D2.incomplete_add(A);
+            let op = D2.incomplete_add(A, bn);
             A = op.0;
             result.transcript[i] = op.1;
             result.x[8+i] = A.x;
             result.y[8+i] = A.y;
             result.z[8+i] = A.z;
             result.x[7-i] = A.x;
-            result.y[7-i] = A.y.__negate();
+            result.y[7-i] = bn.__negate(A.y);
             result.z[7-i] = A.z;
         }
 
@@ -176,7 +187,10 @@ impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
     /**
      * @brief get a value out of the lookup table
      **/
-    unconstrained fn get<CurveParams>(self, idx: u8) -> CurveJ<BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNum> {
+    unconstrained fn get<CurveParams>(
+        self,
+        idx: u8
+    ) -> CurveJ<BigNumInstance, BigNum, CurveParams> where CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
         CurveJ { x: self.x[idx], y: self.y[idx], z: self.z[idx], is_infinity: false }
     }
 }
@@ -184,18 +198,18 @@ impl<BigNum> PointTable<BigNum> where BigNum: BigNumTrait {
 /**
  * @brief construct from BigCurve
  **/
-impl<BigNum, CurveParams> std::convert::From<BigCurve<BigNum, CurveParams>> for CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNum> {
-    fn from(affine_point: BigCurve<BigNum, CurveParams>) -> Self {
+impl<BigNumInstance, BigNum, CurveParams> std::convert::From<BigCurve<BigNumInstance, BigNum, CurveParams>> for CurveJ<BigNumInstance, BigNum, CurveParams> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
+    fn from(affine_point: BigCurve<BigNumInstance, BigNum, CurveParams>) -> Self {
         CurveJ{ x: affine_point.x, y: affine_point.y, z: BigNum::one(), is_infinity: affine_point.is_infinity }
     }
 }
 
-/**
+impl<BigNumInstance, BigNum, CurveParams> CurveJ<BigNumInstance, BigNum, CurveParams> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum>, CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
+    /**
  * @brief are two Jacobian points equal?
  * @description only really used in tests for now.
  **/
-impl<BigNum, CurveParams> std::cmp::Eq for CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNum> {
-    fn eq(self, other: Self) -> bool {
+    fn eq(bn: BigNumInstance, self, other: Self) -> bool {
         // if x == y then (X1 / Z1 * Z1 = X2 / Z2 * Z2)
         //            and (Y1 / Z1 * Z1 * Z1 = Y2 / Z2 * Z2 * Z2)
 
@@ -204,32 +218,29 @@ impl<BigNum, CurveParams> std::cmp::Eq for CurveJ<BigNum, CurveParams> where Big
         // Y1 * Z2 * Z2 * Z2 == Y2 * Z1 * Z1 * Z1
         let z1 = self.z;
         let z2 = other.z;
-        let z1z1 = z1.__mulmod(z1);
-        let z1z1z1 = z1z1.__mulmod(z1);
-        let z2z2 = z2.__mulmod(z2);
-        let z2z2z2 = z2z2.__mulmod(z2);
+        let z1z1 = bn.__mulmod(z1, z1);
+        let z1z1z1 = bn.__mulmod(z1z1, z1);
+        let z2z2 = bn.__mulmod(z2, z2);
+        let z2z2z2 = bn.__mulmod(z2z2, z2);
 
-        let x_lhs = self.x.__mulmod(z2z2);
-        let x_rhs = other.x.__mulmod(z1z1);
-        let y_lhs = self.y.__mulmod(z2z2z2);
-        let y_rhs = other.y.__mulmod(z1z1z1);
+        let x_lhs = bn.__mulmod(self.x, z2z2);
+        let x_rhs = bn.__mulmod(other.x, z1z1);
+        let y_lhs = bn.__mulmod(self.y, z2z2z2);
+        let y_rhs = bn.__mulmod(other.y, z1z1z1);
         let lhs_infinity = self.is_infinity;
         let rhs_infinity = other.is_infinity;
         let both_not_infinity = !(lhs_infinity & rhs_infinity);
         let both_infinity = !both_not_infinity;
 
-        let mut points_equal = (x_lhs.eq(x_rhs) & y_lhs.eq(y_rhs)) & both_not_infinity;
+        let mut points_equal = (bn.eq(x_lhs, x_rhs) & bn.eq(y_lhs, y_rhs)) & both_not_infinity;
         points_equal = points_equal | both_infinity;
         points_equal
     }
-}
-
-impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNum> {
     /**
      * @brief negate a point
      **/
-    fn neg(self) -> Self {
-        CurveJ { x: self.x, y: self.y.__negate(), z: self.z, is_infinity: self.is_infinity }
+    fn neg(self, bn: BigNumInstance) -> Self {
+        CurveJ { x: self.x, y: bn.__negate(self.y), z: self.z, is_infinity: self.is_infinity }
     }
 
     unconstrained fn new() -> Self {
@@ -240,10 +251,19 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         CurveJ { x: BigNum::new(), y: BigNum::new(), z: BigNum::new(), is_infinity: true }
     }
 
-    unconstrained fn sub(self, p2: Self) -> (Self, JTranscript<BigNum>) {
-        self.add(p2.neg())
+    unconstrained fn sub(
+        self,
+        p2: Self,
+        bn: BigNumInstance
+    ) -> (Self, JTranscript<BigNumInstance, BigNum>) {
+        self.add(p2.neg(bn), bn)
     }
-    unconstrained fn add(self, p2: Self) -> (Self, JTranscript<BigNum>) {
+
+    unconstrained fn add(
+        self,
+        p2: Self,
+        bn: BigNumInstance
+    ) -> (Self, JTranscript<BigNumInstance, BigNum>) {
         // TODO: once we have linear expressions as unconstrained fns, replace this with something that has no addmods, submods
         let X1 = self.x;
         let X2 = p2.x;
@@ -251,19 +271,19 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         let Y2 = p2.y;
         let Z1 = self.z;
         let Z2 = p2.z;
-        let Z2Z2 = Z2.__mulmod(Z2);
-        let Z1Z1 = Z1.__mulmod(Z1);
-        let Z2Z2Z2 = Z2Z2.__mulmod(Z2);
-        let Z1Z1Z1 = Z1Z1.__mulmod(Z1);
-        let U1 = X1.__mulmod(Z2Z2);
-        let U2 = X2.__mulmod(Z1Z1);
-        let S1 = Y1.__mulmod(Z2Z2Z2);
-        let S2 = Y2.__mulmod(Z1Z1Z1);
-        let R = S2.__submod(S1);
+        let Z2Z2 = bn.__mulmod(Z2, Z2);
+        let Z1Z1 = bn.__mulmod(Z1, Z1);
+        let Z2Z2Z2 = bn.__mulmod(Z2Z2, Z2);
+        let Z1Z1Z1 = bn.__mulmod(Z1Z1, Z1);
+        let U1 = bn.__mulmod(X1, Z2Z2);
+        let U2 = bn.__mulmod(X2, Z1Z1);
+        let S1 = bn.__mulmod(Y1, Z2Z2Z2);
+        let S2 = bn.__mulmod(Y2, Z1Z1Z1);
+        let R = bn.__submod(S2, S1);
 
         // x1*z2*z2 == x2*z1*z1 => U2 == U2
-        let x_equal_predicate = U2.eq(U1);
-        let y_equal_predicate = S2.eq(S1);
+        let x_equal_predicate = bn.eq(U2, U1);
+        let y_equal_predicate = bn.eq(S2, S1);
         let lhs_infinity = self.is_infinity;
         let rhs_infinity = p2.is_infinity;
         let double_predicate = x_equal_predicate & y_equal_predicate & !lhs_infinity & !rhs_infinity;
@@ -274,11 +294,11 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         println(f"add predicate = {add_predicate}");
         println(f"lhs infinity = {lhs_infinity}");
         println(f"rhs infinity = {rhs_infinity}");
-        let mut result: (Self, JTranscript<BigNum>) = (CurveJ::new(), JTranscript::new());
+        let mut result: (Self, JTranscript<BigNumInstance, BigNum>) = (CurveJ::new(), JTranscript::new());
         if (double_predicate) {
-            result = self.dbl();
+            result = self.dbl(bn);
         } else if (add_predicate) {
-            result = self.incomplete_add(p2);
+            result = self.incomplete_add(p2, bn);
         } else if (infinity_predicate) {
             result = (CurveJ::point_at_infinity(), JTranscript::new() );
         } else if (lhs_infinity & !rhs_infinity) {
@@ -334,7 +354,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
      * @note This method minimizes the number of calls to `compute_quadratic_expression`,
      * which is NOT the same as minimizing the number of multiplications.
      **/
-    unconstrained fn incomplete_add(self, p2: Self) -> (Self, JTranscript<BigNum>) {
+    unconstrained fn incomplete_add(self, p2: Self, bn: BigNumInstance) -> (Self, JTranscript<BigNumInstance, BigNum>) {
         // TODO: once we have linear expressions as unconstrained fns, replace this with something that has no addmods, submods
         let X1 = self.x;
         let X2 = p2.x;
@@ -342,19 +362,19 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         let Y2 = p2.y;
         let Z1 = self.z;
         let Z2 = p2.z;
-        let Z2Z2 = Z2.__mulmod(Z2);
-        let Z1Z1 = Z1.__mulmod(Z1);
-        let Z2Z2Z2 = Z2Z2.__mulmod(Z2);
-        let Z1Z1Z1 = Z1Z1.__mulmod(Z1);
-        let U1 = X1.__mulmod(Z2Z2);
-        let U2 = X2.__mulmod(Z1Z1);
-        let S1 = Y1.__mulmod(Z2Z2Z2);
-        let S2 = Y2.__mulmod(Z1Z1Z1);
-        let R = S2.__submod(S1);
+        let Z2Z2 = bn.__mulmod(Z2, Z2);
+        let Z1Z1 = bn.__mulmod(Z1, Z1);
+        let Z2Z2Z2 = bn.__mulmod(Z2Z2, Z2);
+        let Z1Z1Z1 = bn.__mulmod(Z1Z1, Z1);
+        let U1 = bn.__mulmod(X1, Z2Z2);
+        let U2 = bn.__mulmod(X2, Z1Z1);
+        let S1 = bn.__mulmod(Y1, Z2Z2Z2);
+        let S2 = bn.__mulmod(Y2, Z1Z1Z1);
+        let R = bn.__submod(S2, S1);
 
-        let (_, PP): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression([[U2, U1]], [[false, true]], [[U2, U1]], [[false, true]], [], []);
+        let (_, PP): (BigNum, BigNum ) = bn.__compute_quadratic_expression([[U2, U1]], [[false, true]], [[U2, U1]], [[false, true]], [], []);
 
-        let (_, X3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, X3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[BigNum::new(), PP], [R, BigNum::new()]],
             [[false, true], [false, false]],
             [[U1, U2], [R, BigNum::new()]],
@@ -363,7 +383,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             []
         );
 
-        let (_, U1S2_minus_U2S1): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, U1S2_minus_U2S1): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[U1], [U2]],
             [[false], [true]],
             [[S2], [S1]],
@@ -371,7 +391,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             [],
             []
         );
-        let (_, Y3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, Y3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[PP], [X3]],
             [[false], [false]],
             [[U1S2_minus_U2S1], [R]],
@@ -379,8 +399,8 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             [],
             []
         );
-        let Z1Z2 = Z1.__mulmod(Z2);
-        let (_, Z3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let Z1Z2 = bn.__mulmod(Z1, Z2);
+        let (_, Z3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[Z1Z2, BigNum::new()]],
             [[false, false]],
             [[U2, U1]],
@@ -399,13 +419,13 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
      * @note This method minimizes the number of calls to `compute_quadratic_expression`,
      * which is NOT the same as minimizing the number of multiplications.
      **/
-    unconstrained fn dbl(self) -> (Self, JTranscript<BigNum>) {
+    unconstrained fn dbl(self, bn: BigNumInstance) -> (Self, JTranscript<BigNumInstance, BigNum>) {
         let X1 = self.x;
         let Y1 = self.y;
         let Z1 = self.z;
 
-        let (_, YY_mul_2): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression([[Y1]], [[false]], [[Y1, Y1]], [[false, false]], [], []);
-        let (_, XX_mul_3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, YY_mul_2): (BigNum, BigNum ) = bn.__compute_quadratic_expression([[Y1]], [[false]], [[Y1, Y1]], [[false, false]], [], []);
+        let (_, XX_mul_3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[X1]],
             [[false]],
             [[X1, X1, X1]],
@@ -413,8 +433,8 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             [],
             []
         );
-        let (_, D): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression([[X1, X1]], [[false, false]], [[YY_mul_2]], [[false]], [], []);
-        let mut (_, X3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, D): (BigNum, BigNum ) = bn.__compute_quadratic_expression([[X1, X1]], [[false, false]], [[YY_mul_2]], [[false]], [], []);
+        let mut (_, X3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[XX_mul_3]],
             [[false]],
             [[XX_mul_3]],
@@ -422,7 +442,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             [D, D],
             [true, true]
         );
-        let (_, Y3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression(
+        let (_, Y3): (BigNum, BigNum ) = bn.__compute_quadratic_expression(
             [[XX_mul_3], [YY_mul_2]],
             [[false], [true]],
             [[D, X3], [YY_mul_2, YY_mul_2]],
@@ -432,11 +452,11 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         );
         // TODO: tidy this up and make more efficient?!
         if (CurveParams::a().get_limb(0) != 0) {
-            let ZZ = Z1.mul(Z1);
-            let AZZZZ = ZZ.mul(ZZ).mul(CurveParams::a());
-            X3 = X3.add(AZZZZ);
+            let ZZ = bn.mul(Z1, Z1);
+            let AZZZZ = bn.mul(bn.mul(ZZ, ZZ), (CurveParams::a()));
+            X3 = bn.add(X3, AZZZZ);
         }
-        let (_, Z3): (BigNum, BigNum ) = BigNum::__compute_quadratic_expression([[Y1]], [[false]], [[Z1, Z1]], [[false, false]], [], []);
+        let (_, Z3): (BigNum, BigNum ) = bn.__compute_quadratic_expression([[Y1]], [[false]], [[Z1, Z1]], [[false, false]], [], []);
         (
             CurveJ { x: X3, y: Y3, z: Z3, is_infinity: false }, JTranscript { lambda_numerator: XX_mul_3, x3: X3, y3: Y3, z3: Z3 }
         )
@@ -468,46 +488,50 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
     /**
      * @brief Perform an ecc scalar multiplication and output the generated AffineTranscript
      **/
-    unconstrained fn mul<let NScalarSlices: u32>(self, scalar: ScalarField<NScalarSlices>) -> (Self, [AffineTranscript<BigNum>]) {
-        let mut transcript: [JTranscript<BigNum>] = &[];
+    unconstrained fn mul<let NScalarSlices: u32>(
+        self,
+        scalar: ScalarField<NScalarSlices>,
+        bn: BigNumInstance
+    ) -> (Self, [AffineTranscript<BigNumInstance, BigNum>]) {
+        let mut transcript: [JTranscript<BigNumInstance, BigNum>] = &[];
 
         let input: Self = CurveJ::conditional_select(CurveJ::one(), self, self.is_infinity);
         let scalar: ScalarField<NScalarSlices> = ScalarField::conditional_select(ScalarField::zero(), scalar, self.is_infinity);
 
-        let T = PointTable::new(input);
+        let T = PointTable::new(bn, input);
         for i in 0..8 {
             transcript = transcript.push_back(T.transcript[i]);
         }
 
         let mut accumulator: Self = CurveJ::offset_generator();
-        let op = accumulator.incomplete_add(T.get(scalar.base4_slices[0]));
+        let op = accumulator.incomplete_add(T.get(scalar.base4_slices[0]), bn);
         transcript = transcript.push_back(op.1);
         accumulator = op.0;
         for i in 1..NScalarSlices {
             for _ in 0..4 {
-                let op = accumulator.dbl();
+                let op = accumulator.dbl(bn);
                 accumulator = op.0;
                 transcript = transcript.push_back(op.1);
             }
-            let op = accumulator.incomplete_add(T.get(scalar.base4_slices[i]));
+            let op = accumulator.incomplete_add(T.get(scalar.base4_slices[i]), bn);
             transcript = transcript.push_back(op.1);
             accumulator = op.0;
         }
 
         if scalar.skew {
-            let op = accumulator.incomplete_add(input.neg());
+            let op = accumulator.incomplete_add(input.neg(bn), bn);
             transcript = transcript.push_back(op.1);
             accumulator = op.0;
         } else {
             transcript = transcript.push_back(JTranscript::new());
         }
 
-        let op = accumulator.sub(CurveJ::offset_generator_final());
+        let op = accumulator.sub(CurveJ::offset_generator_final(), bn);
         transcript = transcript.push_back(op.1);
         accumulator = op.0;
 
         println(f"FINAL ACCUMULATOR = {accumulator}");
-        let affine_transcript: [AffineTranscript<BigNum>] = AffineTranscript::from_jacobian_transcript(transcript);
+        let affine_transcript: [AffineTranscript<BigNumInstance, BigNum>] = AffineTranscript::from_jacobian_transcript(transcript, bn);
 
         (accumulator, affine_transcript)
     }
@@ -517,10 +541,11 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
      **/
     unconstrained fn msm_partial<let Size: u32, let NScalarSlices: u32>(
         mut points: [Self; Size],
-        mut scalars: [ScalarField<NScalarSlices>; Size]
-    ) -> (Self, [JTranscript<BigNum>]) {
-        let mut transcript: [JTranscript<BigNum>] = &[];
-        let mut tables: [PointTable<BigNum>; Size] = [PointTable::empty(); Size];
+        mut scalars: [ScalarField<NScalarSlices>; Size],
+        bn: BigNumInstance
+    ) -> (Self, [JTranscript<BigNumInstance, BigNum>]) {
+        let mut transcript: [JTranscript<BigNumInstance, BigNum>] = &[];
+        let mut tables: [PointTable<BigNumInstance, BigNum>; Size] = [PointTable::empty(); Size];
 
         let mut _inputs: [Self; Size] = [CurveJ::new(); Size];
         let mut  _scalars: [ScalarField<NScalarSlices>; Size] = [ScalarField::new(); Size];
@@ -532,32 +557,32 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         scalars = _scalars;
 
         for i in 0..Size {
-            tables[i] = PointTable::new(points[i]);
+            tables[i] = PointTable::new(bn, points[i]);
             for j in 0..8 {
                 transcript = transcript.push_back(tables[i].transcript[j]);
             }
         }
 
         let mut accumulator: Self = CurveJ::offset_generator();
-        let op = accumulator.incomplete_add(tables[0].get(scalars[0].base4_slices[0]));
+        let op = accumulator.incomplete_add(tables[0].get(scalars[0].base4_slices[0]), bn);
         transcript = transcript.push_back(op.1);
         accumulator = op.0;
 
         for i in 1..Size {
             println(f"SizeIt = {i}");
-            let op = accumulator.incomplete_add(tables[i].get(scalars[i].base4_slices[0]));
+            let op = accumulator.incomplete_add(tables[i].get(scalars[i].base4_slices[0]), bn);
             transcript = transcript.push_back(op.1);
             accumulator = op.0;
         }
         for i in 1..NScalarSlices {
             println(f"ScalarSliceIt = {i}");
             for _ in 0..4 {
-                let op = accumulator.dbl();
+                let op = accumulator.dbl(bn);
                 accumulator = op.0;
                 transcript = transcript.push_back(op.1);
             }
             for j in 0..Size {
-                let op = accumulator.incomplete_add(tables[j].get(scalars[j].base4_slices[i]));
+                let op = accumulator.incomplete_add(tables[j].get(scalars[j].base4_slices[i]), bn);
                 transcript = transcript.push_back(op.1);
                 accumulator = op.0;
             }
@@ -565,7 +590,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
 
         for i in 0..Size {
             if scalars[i].skew {
-                let op = accumulator.incomplete_add(points[i].neg());
+                let op = accumulator.incomplete_add(points[i].neg(bn), bn);
                 transcript = transcript.push_back(op.1);
                 accumulator = op.0;
             } else {
@@ -585,24 +610,26 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
      **/
     unconstrained fn msm<let Size: u32, let NScalarSlices: u32>(
         mut points: [Self; Size],
-        mut scalars: [ScalarField<NScalarSlices>; Size]
-    ) -> (Self, [AffineTranscript<BigNum>]) {
-        let mut (accumulator, transcript) = CurveJ::msm_partial(points, scalars);
-        let op = accumulator.sub(CurveJ::offset_generator_final());
+        mut scalars: [ScalarField<NScalarSlices>; Size],
+        bn: BigNumInstance
+    ) -> (Self, [AffineTranscript<BigNumInstance, BigNum>]) {
+        let mut (accumulator, transcript) = CurveJ::msm_partial(points, scalars, bn);
+        let op = accumulator.sub(CurveJ::offset_generator_final(), bn);
         transcript = transcript.push_back(op.1);
         accumulator = op.0;
-        let affine_transcript: [AffineTranscript<BigNum>] = AffineTranscript::from_jacobian_transcript(transcript);
+        let affine_transcript: [AffineTranscript<BigNumInstance, BigNum>] = AffineTranscript::from_jacobian_transcript(transcript, bn);
 
         (accumulator, affine_transcript)
     }
 
     unconstrained fn compute_linear_expression_transcript<let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>(
-        mul_points: [BigCurve<BigNum, CurveParams>; NMuls],
+        mul_points: [BigCurve<BigNumInstance, BigNum, CurveParams>; NMuls],
         mul_scalars: [ScalarField<NScalarSlices>; NMuls],
-        add_points: [BigCurve<BigNum, CurveParams>; NAdds]
-    ) -> AffineLinearExpressionTranscript<BigNum, CurveParams, NScalarSlices, NMuls, NAdds> {
-        let mut mul_j: [CurveJ<BigNum, CurveParams>; NMuls] = [CurveJ::new(); NMuls];
-        let mut add_j: [CurveJ<BigNum, CurveParams>; NAdds] = [CurveJ::new(); NAdds];
+        add_points: [BigCurve<BigNumInstance, BigNum, CurveParams>; NAdds],
+        bn: BigNumInstance
+    ) -> AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, NScalarSlices, NMuls, NAdds> {
+        let mut mul_j: [CurveJ<BigNumInstance, BigNum, CurveParams>; NMuls] = [CurveJ::new(); NMuls];
+        let mut add_j: [CurveJ<BigNumInstance, BigNum, CurveParams>; NAdds] = [CurveJ::new(); NAdds];
         for i in 0..NMuls {
             mul_j[i] = CurveJ::from(mul_points[i]);
         }
@@ -610,7 +637,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
             add_j[i] = CurveJ::from(add_points[i]);
         }
 
-        let mut jacobian_transcript: LinearExpressionTranscript<BigNum, CurveParams,NScalarSlices,NMuls,NAdds> = LinearExpressionTranscript {
+        let mut jacobian_transcript: LinearExpressionTranscript<BigNumInstance, BigNum, CurveParams,NScalarSlices,NMuls,NAdds> = LinearExpressionTranscript {
             table_transcript: [[JTranscript::new(); 8]; NMuls],
             msm_double_transcript: [[JTranscript::new(); 4]; NScalarSlices],
             msm_add_transcript: [[JTranscript::new(); NMuls]; NScalarSlices],
@@ -620,7 +647,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         };
 
         // #####
-        let mut tables: [PointTable<BigNum>; NMuls] = [PointTable::empty(); NMuls];
+        let mut tables: [PointTable<BigNumInstance, BigNum>; NMuls] = [PointTable::empty(); NMuls];
 
         let mut _inputs: [Self; NMuls] = [CurveJ::new(); NMuls];
         let mut  _scalars: [ScalarField<NScalarSlices>; NMuls] = [ScalarField::new(); NMuls];
@@ -632,32 +659,32 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         let scalars = _scalars;
 
         for i in 0..NMuls {
-            tables[i] = PointTable::new(points[i]);
+            tables[i] = PointTable::new(bn, points[i]);
             for j in 0..8 {
                 jacobian_transcript.table_transcript[i][j] = tables[i].transcript[j];
             }
         }
 
         let mut accumulator: Self = CurveJ::offset_generator();
-        let op = accumulator.incomplete_add(tables[0].get(scalars[0].base4_slices[0]));
+        let op = accumulator.incomplete_add(tables[0].get(scalars[0].base4_slices[0]), bn);
         jacobian_transcript.msm_add_transcript[0][0] = op.1;
         accumulator = op.0;
 
         for i in 1..NMuls {
             println(f"SizeIt = {i}");
-            let op = accumulator.incomplete_add(tables[i].get(scalars[i].base4_slices[0]));
+            let op = accumulator.incomplete_add(tables[i].get(scalars[i].base4_slices[0]), bn);
             jacobian_transcript.msm_add_transcript[0][i] = op.1;
             accumulator = op.0;
         }
         for i in 1..NScalarSlices {
             println(f"ScalarSliceIt = {i}");
             for j in 0..4 {
-                let op = accumulator.dbl();
+                let op = accumulator.dbl(bn);
                 accumulator = op.0;
                 jacobian_transcript.msm_double_transcript[i][j] = op.1;
             }
             for j in 0..NMuls {
-                let op = accumulator.incomplete_add(tables[j].get(scalars[j].base4_slices[i]));
+                let op = accumulator.incomplete_add(tables[j].get(scalars[j].base4_slices[i]), bn);
                 jacobian_transcript.msm_add_transcript[i][j] = op.1;
                 accumulator = op.0;
             }
@@ -665,7 +692,7 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
 
         for i in 0..NMuls {
             if scalars[i].skew {
-                let op = accumulator.incomplete_add(points[i].neg());
+                let op = accumulator.incomplete_add(points[i].neg(bn), bn);
                 jacobian_transcript.skew_transcript[i] = op.1;
                 accumulator = op.0;
             } else {
@@ -674,36 +701,36 @@ impl<BigNum, CurveParams> CurveJ<BigNum, CurveParams> where BigNum: BigNumTrait,
         }
 
         for i in 0..NAdds {
-            let op = accumulator.incomplete_add(add_j[i]);
+            let op = accumulator.incomplete_add(add_j[i], bn);
             jacobian_transcript.add_transcript[i] = op.1;
             accumulator = op.0;
         }
 
-        let op = accumulator.sub(CurveJ::offset_generator_final());
+        let op = accumulator.sub(CurveJ::offset_generator_final(), bn);
         jacobian_transcript.offset_generator_transcript = op.1;
         accumulator = op.0;
 
-        let affine_transcript: AffineLinearExpressionTranscript<BigNum, CurveParams, NScalarSlices, NMuls, NAdds> = AffineLinearExpressionTranscript::from_jtranscript(jacobian_transcript);
+        let affine_transcript: AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, NScalarSlices, NMuls, NAdds> = AffineLinearExpressionTranscript::from_jtranscript(jacobian_transcript, bn);
         affine_transcript
     }
 }
 
-struct LinearExpressionTranscript<BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>{
-    table_transcript: [[JTranscript<BigNum, CurveParams>; 8]; NMuls],
-    msm_double_transcript: [[JTranscript<BigNum, CurveParams>; 4]; NScalarSlices],
-    msm_add_transcript: [[JTranscript<BigNum, CurveParams>; NMuls]; NScalarSlices],
-    skew_transcript: [JTranscript<BigNum, CurveParams>; NMuls],
-    add_transcript: [JTranscript<BigNum, CurveParams>; NAdds],
-    offset_generator_transcript: JTranscript<BigNum, CurveParams>
+struct LinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>{
+    table_transcript: [[JTranscript<BigNumInstance, BigNum, CurveParams>; 8]; NMuls],
+    msm_double_transcript: [[JTranscript<BigNumInstance, BigNum, CurveParams>; 4]; NScalarSlices],
+    msm_add_transcript: [[JTranscript<BigNumInstance, BigNum, CurveParams>; NMuls]; NScalarSlices],
+    skew_transcript: [JTranscript<BigNumInstance, BigNum, CurveParams>; NMuls],
+    add_transcript: [JTranscript<BigNumInstance, BigNum, CurveParams>; NAdds],
+    offset_generator_transcript: JTranscript<BigNumInstance, BigNum, CurveParams>
 }
 
-struct AffineLinearExpressionTranscript<BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>{
-    table_transcript: [[AffineTranscript<BigNum, CurveParams>; 8]; NMuls],
-    msm_double_transcript: [[AffineTranscript<BigNum, CurveParams>; 4]; NScalarSlices],
-    msm_add_transcript: [[AffineTranscript<BigNum, CurveParams>; NMuls]; NScalarSlices],
-    skew_transcript: [AffineTranscript<BigNum, CurveParams>; NMuls],
-    add_transcript: [AffineTranscript<BigNum, CurveParams>; NAdds],
-    offset_generator_transcript: AffineTranscript<BigNum, CurveParams>
+struct AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>{
+    table_transcript: [[AffineTranscript<BigNumInstance, BigNum, CurveParams>; 8]; NMuls],
+    msm_double_transcript: [[AffineTranscript<BigNumInstance, BigNum, CurveParams>; 4]; NScalarSlices],
+    msm_add_transcript: [[AffineTranscript<BigNumInstance, BigNum, CurveParams>; NMuls]; NScalarSlices],
+    skew_transcript: [AffineTranscript<BigNumInstance, BigNum, CurveParams>; NMuls],
+    add_transcript: [AffineTranscript<BigNumInstance, BigNum, CurveParams>; NAdds],
+    offset_generator_transcript: AffineTranscript<BigNumInstance, BigNum, CurveParams>
 }
 
 // unconstrained fn from_jacobian_transcript(j_tx: [JTranscript<BigNum>]) -> [AffineTranscript<BigNum>] {
@@ -729,9 +756,12 @@ struct AffineLinearExpressionTranscript<BigNum, CurveParams, let NScalarSlices: 
 //     result
 // }
 
-impl<BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>  AffineLinearExpressionTranscript<BigNum, CurveParams,NScalarSlices,NMuls,NAdds> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNum> {
+impl<BigNumInstance, BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64>  AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams,NScalarSlices,NMuls,NAdds> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum>, CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {
 
-    unconstrained fn from_jtranscript(jtranscript: LinearExpressionTranscript<BigNum, CurveParams,  NScalarSlices,  NMuls,  NAdds>) -> Self {
+    unconstrained fn from_jtranscript(
+        jtranscript: LinearExpressionTranscript<BigNumInstance, BigNum, CurveParams,  NScalarSlices,  NMuls,  NAdds>,
+        bn: BigNumInstance
+    ) -> Self {
         let mut inverses: [BigNum] = &[];
 
         for i in 0..NMuls {
@@ -760,9 +790,9 @@ impl<BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64
         }
         inverses = inverses.push_back(jtranscript.offset_generator_transcript.z3);
 
-        BigNum::__batch_invert(&mut inverses);
+        let inverses = bn.__batch_invert(inverses.as_array());
 
-        let mut result: AffineLinearExpressionTranscript<BigNum, CurveParams,NScalarSlices,NMuls,NAdds> = AffineLinearExpressionTranscript {
+        let mut result: AffineLinearExpressionTranscript<BigNumInstance, BigNum, CurveParams,NScalarSlices,NMuls,NAdds> = AffineLinearExpressionTranscript {
             table_transcript: [[AffineTranscript::new(); 8]; NMuls],
             msm_double_transcript: [[AffineTranscript::new(); 4]; NScalarSlices],
             msm_add_transcript: [[AffineTranscript::new(); NMuls]; NScalarSlices],
@@ -774,62 +804,65 @@ impl<BigNum, CurveParams, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64
         let mut it = 0;
         for i in 0..NMuls {
             for j in 0..8 {
-                result.table_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.table_transcript[i][j], inverses[it]);
+                result.table_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.table_transcript[i][j], inverses[it], bn);
                 it+=1;
             }
         }
         for i in 0..NMuls {
-            result.msm_add_transcript[0][i] = AffineTranscript::from_j_with_hint(jtranscript.msm_add_transcript[0][i], inverses[it]);
+            result.msm_add_transcript[0][i] = AffineTranscript::from_j_with_hint(jtranscript.msm_add_transcript[0][i], inverses[it], bn);
             it+=1;
         }
         for i in 1..NScalarSlices {
             for j in 0..4 {
-                result.msm_double_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.msm_double_transcript[i][j], inverses[it]);
+                result.msm_double_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.msm_double_transcript[i][j], inverses[it], bn);
                 it+=1;
             }
 
             for j in 0..NMuls {
-                result.msm_add_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.msm_add_transcript[i][j], inverses[it]);
+                result.msm_add_transcript[i][j] = AffineTranscript::from_j_with_hint(jtranscript.msm_add_transcript[i][j], inverses[it], bn);
                 it+=1;
             }
         }
 
         for i in 0..NMuls {
-            result.skew_transcript[i] = AffineTranscript::from_j_with_hint(jtranscript.skew_transcript[i], inverses[it]);
+            result.skew_transcript[i] = AffineTranscript::from_j_with_hint(jtranscript.skew_transcript[i], inverses[it], bn);
             it+=1;
         }
         for i in 0..NAdds {
-            result.add_transcript[i] = AffineTranscript::from_j_with_hint(jtranscript.add_transcript[i], inverses[it]);
+            result.add_transcript[i] = AffineTranscript::from_j_with_hint(jtranscript.add_transcript[i], inverses[it], bn);
             it+=1;
         }
 
-        result.offset_generator_transcript = AffineTranscript::from_j_with_hint(jtranscript.offset_generator_transcript, inverses[it]);
+        result.offset_generator_transcript = AffineTranscript::from_j_with_hint(jtranscript.offset_generator_transcript, inverses[it], bn);
 
         result
     }
 }
-impl<BigNum, CurveParams, let NBits: u64, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64> LinearExpressionTranscript<BigNum, CurveParams, NBits,  NScalarSlices,  NMuls,  NAdds> where BigNum: BigNumTrait, CurveParams: CurveParamsTrait<BigNum> {}
+impl<BigNumInstance, BigNum, CurveParams, let NBits: u64, let NScalarSlices: u64, let NMuls: u64, let NAdds: u64> LinearExpressionTranscript<BigNumInstance, BigNum, CurveParams, NBits,  NScalarSlices,  NMuls,  NAdds> where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum>, CurveParams: CurveParamsTrait<BigNumInstance, BigNum> {}
 
 // TODO: this should probably be in bignum
-unconstrained pub fn batch_invert<BigNum>(x: &mut [BigNum]) where BigNum: BigNumTrait {
-    let mut accumulator: BigNum = BigNum::one();
+// unconstrained pub fn batch_invert<BigNum, BigNumInstance>(
+//     x: &mut [BigNum],
+//     bn: BigNumInstance
+// ) where BigNum: BigNumTrait, BigNumInstance: BigNumInstanceTrait<BigNum> {
+//     let mut accumulator: BigNum = BigNum::one();
 
-    let mut temporaries: [BigNum] = &[];
-    for i in 0..x.len() {
-        temporaries = temporaries.push_back(accumulator);
-        if (x[i].__is_zero() == false) {
-            accumulator = accumulator.__mulmod(x[i]);
-        }
-    }
+//     let mut temporaries: [BigNum] = &[];
+//     for i in 0..x.len() {
+//         temporaries = temporaries.push_back(accumulator);
+//         if (x[i].__is_zero() == false) {
+//             accumulator = bn.__mulmod(accumulator, x[i]);
+//         }
+//     }
 
-    accumulator = accumulator.__invmod();
-    let mut T0: BigNum = BigNum::new();
-    for i in 0..x.len() {
-        let idx = x.len() - 1 - i;
-        if (x[idx].__is_zero() == false) {
-            T0 = accumulator.__mulmod(temporaries[idx]);
-            accumulator = accumulator.__mulmod(x[idx]);
-            x[idx] = T0;
-        }
-    }
-}
+//     accumulator = bn.__invmod(accumulator);
+//     let mut T0: BigNum = BigNum::new();
+//     for i in 0..x.len() {
+//         let idx = x.len() - 1 - i;
+//         if (x[idx].__is_zero() == false) {
+//             T0 = bn.__mulmod(accumulator, temporaries[idx]);
+//             accumulator = bn.__mulmod(accumulator, x[idx]);
+//             x[idx] = T0;
+//         }
+//     }
+// }
